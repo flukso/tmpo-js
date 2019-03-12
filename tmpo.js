@@ -65,13 +65,14 @@ class Tmpo {
             if (--this.progress.device.todo == 0) {
                 this.progress.device.state = "completed"
             }
-            this.dbPromise.then((db) => {
+            this.dbPromise.then(async (db) => {
                 const tx = db.transaction("sensor", "readwrite")
                 tx.objectStore("sensor").put(sensors, device)
                 for (let i in sensors) {
                     this.progress.sensor.state = "running";
                     this.progress.sensor.todo++;
-                    this._tmpo_last_block(sensors[i].sensor)
+                    const last = await this._last_block(sensors[i].sensor)
+                    this._tmpo_sensor_sync(sensors[i].sensor, last)
                 }
                 if (this.progress.device.state == "completed" &&
                     this.progress.sensor.state != "running") { // edge case
@@ -79,35 +80,6 @@ class Tmpo {
                 }
                 this._progress_cb_handler()
             })
-        })
-    }
-
-    _tmpo_last_block(sensor) {
-        // get all tmpo blocks of a single sensor
-        const range = IDBKeyRange.bound(sensor, `${sensor}~`)
-        const that = this
-        let last = {
-            rid: 0,
-            lvl: 0,
-            bid: 0
-        }
-        this.dbPromise.then((db) => {
-            const tx = db.transaction("tmpo", "readonly")
-            const store = tx.objectStore("tmpo")
-            return store.openKeyCursor(range)
-        })
-        .then(function process(cursor) {
-            if (!cursor) { return }
-            const block = that._key2bid(cursor.key)
-            if (block.bid > last.bid) {
-                last = block
-            }
-            return cursor.continue().then(process)
-        })
-        .then(() => {
-            const last_key = that._bid2key(sensor, last.rid, last.lvl, last.bid)
-            that._log("last", `last block: ${last_key}`)
-            that._tmpo_sensor_sync(sensor, last)
         })
     }
 
