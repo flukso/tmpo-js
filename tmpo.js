@@ -21,7 +21,7 @@ class Tmpo {
         this.progress_cb = (() => { return })
     }
 
-    sync(progress_cb) {
+    sync(progress_cb = (() => { return })) {
         this.sync_completed = false
         this.progress = this._progress_state_init("waiting")
         this.progress_cb = progress_cb
