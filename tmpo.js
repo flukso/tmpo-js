@@ -71,7 +71,7 @@ class Tmpo {
                 for (let i in sensors) {
                     this.progress.sensor.state = "running";
                     this.progress.sensor.todo++;
-                    this._last_block(sensors[i].sensor)
+                    this._tmpo_last_block(sensors[i].sensor)
                 }
                 if (this.progress.device.state == "completed" &&
                     this.progress.sensor.state != "running") { // edge case
@@ -82,7 +82,7 @@ class Tmpo {
         })
     }
 
-    _last_block(sensor) {
+    _tmpo_last_block(sensor) {
         // get all tmpo blocks of a single sensor
         const range = IDBKeyRange.bound(sensor, `${sensor}~`)
         const that = this
@@ -98,7 +98,6 @@ class Tmpo {
         })
         .then(function process(cursor) {
             if (!cursor) { return }
-//            console.log('cursor is at:', cursor.key)
             const block = that._key2bid(cursor.key)
             if (block.bid > last.bid) {
                 last = block
@@ -218,6 +217,108 @@ class Tmpo {
             }
             this._progress_cb_handler()
         })
+    }
+
+    async series(sid, { rid=null, head=0, tail=Number.POSITIVE_INFINITY } = { }) {
+        if (rid == null) {
+            ({ rid } = await this._last_block(sid))
+        }
+        const blocklist = await this._blocklist(sid, rid, head, tail)
+        const blocklist2string = JSON.stringify(blocklist)
+        this._log("series", `sensor ${sid} using blocks: ${blocklist2string}`)
+        const serieslist = await Promise.all(blocklist.map(async (block) => {
+                const content = await this._block_content(sid,
+                    block.rid, block.lvl, block.bid)
+                return this._block2series(content, head, tail)
+            })
+        )
+        return this._serieslist_concat(serieslist)
+    }
+
+    async _last_block(sid) {
+        // get all tmpo blocks of a single sensor
+        const range = IDBKeyRange.bound(sid, `${sid}~`)
+        const that = this
+        let last = {
+            rid: 0,
+            lvl: 0,
+            bid: 0
+        }
+        const db = await this.dbPromise
+        const tx = db.transaction("tmpo", "readonly")
+        const store = tx.objectStore("tmpo")
+        const cursor = store.openKeyCursor(range)
+        return await cursor.then(function process(cursor) {
+            if (!cursor) { return }
+            const block = that._key2bid(cursor.key)
+            if (block.bid > last.bid) {
+                last = block
+            }
+            return cursor.continue().then(process)
+        })
+        .then(() => {
+            const last_key = that._bid2key(sid, last.rid, last.lvl, last.bid)
+            that._log("last", `last block: ${last_key}`)
+            return last
+        })
+    }
+
+    async _blocklist(sid, rid, head, tail) {
+        const that = this
+        // get all tmpo blocks of a single sensor/rid
+        const range = IDBKeyRange.bound(`${sid}-${rid}`, `${sid}-${rid}~`)
+        const db = await this.dbPromise
+        const tx = db.transaction("tmpo", "readonly")
+        const store = tx.objectStore("tmpo")
+        const cursor = store.openKeyCursor(range)
+        let blocklist = []
+        return await cursor.then(function process(cursor) {
+            if (!cursor) { return }
+            const block = that._key2bid(cursor.key)
+            if (head < that._blocktail(block.lvl, block.bid) && tail > block.bid) {
+                blocklist.push(block)
+            }
+            return cursor.continue().then(process)
+        })
+        .then(() => {
+            return blocklist.sort((a, b) => a.bid - b.bid)
+        })
+    }
+
+    _block2series(content, head, tail) {
+        let [t_accu, v_accu] = content.h.head
+        let t = []
+        let v = []
+        for (let i in content.t) {
+            t_accu += content.t[i]
+            v_accu += content.v[i]
+            if (t_accu >= head && t_accu <= tail) {
+                t.push(t_accu)
+                v.push(v_accu)
+            }
+        }
+        return {t: t, v: v}
+    }
+
+    _serieslist_concat(list) {
+        let accu = { t: [], v: [] }
+        for (let { t, v } of list) {
+            accu.t = accu.t.concat(t)
+            accu.v = accu.v.concat(v)
+        }
+        return accu
+    }
+
+    async _block_content(sid, rid, lvl, bid) {
+        const db = await this.dbPromise
+        const key = this._bid2key(sid, rid, lvl, bid)
+        const tx = db.transaction("tmpo")
+        const store = tx.objectStore("tmpo")
+        return store.get(key)
+    }
+
+    _blocktail(lvl, bid) {
+        return bid + Math.pow(2, lvl)
     }
 
     _bid2key(sid, rid, lvl, bid) {
