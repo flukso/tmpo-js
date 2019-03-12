@@ -219,17 +219,19 @@ class Tmpo {
         })
     }
 
-    async series(sid, { rid=null, head=0, tail=Number.POSITIVE_INFINITY } = { }) {
+    async series(sid,
+            { rid=null, head=0, tail=Number.POSITIVE_INFINITY, subsample=0 } = { }) {
         if (rid == null) {
             ({ rid } = await this._last_block(sid))
         }
         const blocklist = await this._blocklist(sid, rid, head, tail)
         const blocklist2string = JSON.stringify(blocklist)
         this._log("series", `sensor ${sid} using blocks: ${blocklist2string}`)
-        const serieslist = await Promise.all(blocklist.map(async (block) => {
+        const serieslist = await Promise.all(
+            blocklist.map(async (block) => {
                 const content = await this._block_content(sid,
                     block.rid, block.lvl, block.bid)
-                return this._block2series(content, head, tail)
+                return this._block2series(content, head, tail, subsample)
             })
         )
         return this._serieslist_concat(serieslist)
@@ -285,16 +287,19 @@ class Tmpo {
         })
     }
 
-    _block2series(content, head, tail) {
+    _block2series(content, head, tail, subsample=0) {
         let [t_accu, v_accu] = content.h.head
+        let t_accu_last = 0
         let t = []
         let v = []
         for (let i in content.t) {
             t_accu += content.t[i]
             v_accu += content.v[i]
-            if (t_accu >= head && t_accu <= tail) {
+            if (t_accu >= head && t_accu <= tail
+                    && t_accu >= t_accu_last + subsample) {
                 t.push(t_accu)
                 v.push(v_accu)
+                t_accu_last = t_accu
             }
         }
         return {t: t, v: v}
