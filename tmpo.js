@@ -3,17 +3,20 @@ $.ajaxSetup({
     cache: false
 })
 
+
 class Tmpo {
     constructor(uid, token, debug=false) {
         this.uid = uid
         this.token = token
         this.debug = debug
-        this.dbPromise = idb.open("flukso", 1, (upgradeDB) => {
+        this.dbPromise = idb.open("flukso", 2, (upgradeDB) => {
             switch (upgradeDB.oldVersion) {
             case 0: // called at DB creation time
                 upgradeDB.createObjectStore("device")
                 upgradeDB.createObjectStore("sensor")
                 upgradeDB.createObjectStore("tmpo")
+            case 1:
+                upgradeDB.createObjectStore("cache")
             }
         })
         this.sync_completed = false
@@ -174,7 +177,7 @@ class Tmpo {
         })
     }
 
-    _tmpo_delete_block(key) {
+    async _tmpo_delete_block(key) {
         this.dbPromise.then((db) => {
             const tx = db.transaction("tmpo", "readwrite")
             const store = tx.objectStore("tmpo")
@@ -191,7 +194,93 @@ class Tmpo {
         })
     }
 
-    async series(sid,
+    async _cache_update(sid) {
+        const day2secs = 86400
+        const tz_offset = -7200
+        let cblock = null
+        let head = 0
+        const last_cid = await this._cache_last_block(sid)
+        if (last_cid) {
+            console.log(last_cid)
+            cblock = await this._cache_block_load(sid, last_cid)
+            head = (Math.floor(cblock.state.last / 256) + 1) * 256
+        }
+        const serieslist = await this._serieslist(sid,
+                { head: head, subsample: 8 })
+        for (const { t, v } of serieslist) {
+            console.log(t, v)
+            for (let [i, _] of t.entries()) {
+                if (!cblock) {
+                    cblock = new CachedBlock(t[i], tz_offset)
+                }
+                if (!cblock.push(t[i], v[i])) {
+                    this._cache_block_store(sid, cblock)
+                    console.log(cblock)
+                    cblock = new CachedBlock(t[i], tz_offset)
+                    cblock.push(t[i], v[i])
+                }
+            }
+        }
+        cblock.close()
+        this._cache_block_store(sid, cblock)
+        console.log(cblock)
+    }
+
+    _cache_block_store(sid, cblock) {
+        const key = this._cid2key(sid, cblock.head)
+        this.dbPromise.then((db) => {
+            const tx = db.transaction("cache", "readwrite")
+            tx.objectStore("cache").put(cblock, key)
+        })
+    }
+
+    async _cache_block_load(sid, cid) {
+        const db = await this.dbPromise
+        const key = this._cid2key(sid, cid)
+        const tx = db.transaction("cache")
+        const store = tx.objectStore("cache")
+        let cblock = await store.get(key)
+        Object.setPrototypeOf(cblock, CachedBlock.prototype)
+        return cblock
+    }
+
+    async _cache_last_block(sid) {
+        // get all cache blocks of a single sensor
+        const range = IDBKeyRange.bound(sid, `${sid}~`)
+        const that = this
+        let last_cid = 0
+        const db = await this.dbPromise
+        const tx = db.transaction("cache", "readonly")
+        const store = tx.objectStore("cache")
+        const cursor = store.openKeyCursor(range)
+        return await cursor.then(function process(cursor) {
+            if (!cursor) { return }
+            const cid = that._key2cid(cursor.key)
+            if (cid > last_cid) {
+                last_cid = cid
+            }
+            return cursor.continue().then(process)
+        })
+        .then(() => {
+            return last_cid
+        })
+    }
+
+    _cid2key(sid, cid) {
+        return `${sid}-${cid}`
+    }
+
+    _key2cid(key) {
+        const cblock_id = key.split("-")
+        return Number(cblock_id[1])
+    }
+
+    async series(sid, params) {
+        const serieslist = await this._serieslist(sid, params)
+        return this._serieslist_concat(serieslist)
+    }
+
+    async _serieslist(sid,
             { rid=null, head=0, tail=Number.POSITIVE_INFINITY, subsample=0 } = { }) {
         if (rid == null) {
             ({ rid } = await this._last_block(sid))
@@ -206,7 +295,7 @@ class Tmpo {
                 return this._block2series(content, head, tail, subsample)
             })
         )
-        return this._serieslist_concat(serieslist)
+        return serieslist
     }
 
     async _last_block(sid) {
@@ -336,6 +425,98 @@ class Tmpo {
         if (this.debug) {
             let time = Date.now()
             console.log(`${time} [${topic}] ${message}`)
+        }
+    }
+}
+
+
+class CachedBlock {
+    constructor(timestamp, tz_offset) {
+        this.day2secs = 86400
+        const x = Math.floor((timestamp - tz_offset) / this.day2secs)
+        this.head = x * this.day2secs + tz_offset
+        this.series = {
+            "avg": [],
+            "min": [],
+            "max": []
+        }
+        for (const metric of ["avg", "min", "max"]) {
+            this.series[metric][60] = Array(1440)
+            this.series[metric][900] = Array(96)
+            this.series[metric][3600] = Array(24)
+            this.series[metric][86400] = Array(1)
+        }
+        this.state = {
+            last: this.head,
+            minute: null,
+            samples: []
+        }
+    }
+
+    push(t, v) {
+        if (t >= this.head + this.day2secs) {
+            this.gen_minute()
+            this.close()
+            return false
+        }
+        if (!this.state.minute) {
+            this.state.minute = Math.floor(t / 60) * 60
+        }
+        if (t < this.state.minute + 60) {
+            this.state.last = t
+            this.state.samples.push(v)
+        } else {
+            this.gen_minute()
+            this.push(t, v)
+        }
+        return true
+    }
+
+    gen_minute() {
+        const i = (this.state.minute - this.head) / 60
+        const len = this.state.samples.length
+        this.series.avg[60][i] =
+                this.state.samples.reduce((a, b) => a + b, 0) / len
+        this.series.min[60][i] = Math.min(...this.state.samples)
+        this.series.max[60][i] = Math.max(...this.state.samples)
+        this.state.minute = null
+        this.state.samples = []
+    }
+
+    close() {
+        const subsampling = [
+            { entries: 96, samples: 15, source:   60, sink:   900 },
+            { entries: 24, samples:  4, source:  900, sink:  3600 },
+            { entries:  1, samples: 24, source: 3600, sink: 86400 }
+        ]
+        for (const s of subsampling) {
+            this.subsample(s)
+        }
+    }
+
+    subsample({ entries, samples, source, sink }) {
+        for (const i of Array(entries).keys()) {
+            let slice = {
+                "avg": null,
+                "min": null,
+                "max": null
+            }
+            slice.avg = this.series.avg[source]
+                    .slice(i * samples, (i + 1) * samples)
+            const len = Object.keys(slice.avg).length
+            if (len == 0) {
+                continue
+            }
+            this.series.avg[sink][i] =
+                    slice.avg.reduce((a, b) => a + b, 0) / len
+            slice.min = this.series.min[source]
+                    .slice(i * samples, (i + 1) * samples)
+            this.series.min[sink][i] =
+                    Math.min(...slice.min.filter(x => x != undefined))
+            slice.max = this.series.max[source]
+                    .slice(i * samples, (i + 1) * samples)
+            this.series.max[sink][i] =
+                    Math.max(...slice.max.filter(x => x != undefined))
         }
     }
 }
