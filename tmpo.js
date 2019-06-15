@@ -61,6 +61,9 @@ class Tmpo {
                 this._progress_cb_handler()
             })
         })
+        .fail(() => {
+            this.progress.sync.all.http_error++
+        })
     }
 
     _sensor_sync(device) {
@@ -90,6 +93,9 @@ class Tmpo {
                 }
                 this._progress_cb_handler()
             })
+        })
+        .fail(() => {
+            this.progress.sync.all.http_error++
         })
     }
 
@@ -121,6 +127,9 @@ class Tmpo {
             }
             this._progress_cb_handler()
         })
+        .fail(() => {
+            this.progress.sync.all.http_error++
+        })
     }
 
     _tmpo_block_sync(sensor, block) {
@@ -148,6 +157,9 @@ class Tmpo {
                 tx.objectStore("tmpo").put(response, key)
                 this._tmpo_clean(sensor, block)
             })
+        })
+        .fail(() => {
+            this.progress.sync.all.http_error++
         })
     }
 
@@ -423,7 +435,12 @@ class Tmpo {
                 sensor: { state: init_state, todo: 0 },
                 block: { state: init_state, todo: 0 },
                 clean: { state: init_state, todo: 0 },
-                all: { state: init_state, start: Date.now(), runtime: 0 }
+                all: {
+                    state: init_state,
+                    http_error: 0,
+                    start: Date.now(),
+                    runtime: 0
+                }
             },
             cache: {
                 state: init_state,
