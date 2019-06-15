@@ -5,9 +5,10 @@ $.ajaxSetup({
 
 
 class Tmpo {
-    constructor(uid, token, debug=false) {
+    constructor(uid, token, cache=true, debug=false) {
         this.uid = uid
         this.token = token
+        this.cache = cache
         this.debug = debug
         this.dbPromise = idb.open("flukso", 2, (upgradeDB) => {
             switch (upgradeDB.oldVersion) {
@@ -19,14 +20,20 @@ class Tmpo {
                 upgradeDB.createObjectStore("cache")
             }
         })
-        this.sync_completed = false
+        this.sync_completed = true
+        this.cache_completed = true
+        this.sensor_cache_update = { }
         this.progress = this._progress_state_init("completed")
         this.progress_cb = (() => { return })
     }
 
     sync(progress_cb = (() => { return })) {
         this.sync_completed = false
+        if (this.cache) {
+            this.cache_completed = false
+        }
         this.progress = this._progress_state_init("waiting")
+        this.progress.sync.all.state = "running"
         this.progress_cb = progress_cb
         this._device_sync()
     }
@@ -44,12 +51,12 @@ class Tmpo {
                 const tx = db.transaction("device", "readwrite")
                 tx.objectStore("device").put(devices, this.uid)
                 for (let i in devices) {
-                    this.progress.device.state = "running"
-                    this.progress.device.todo++;
+                    this.progress.sync.device.state = "running"
+                    this.progress.sync.device.todo++;
                     this._sensor_sync(devices[i].device)
                 }
-                if (this.progress.device.state == "waiting") {
-                    this.progress.all.state = "completed"
+                if (this.progress.sync.device.state == "waiting") {
+                    this.progress.sync.all.state = "completed"
                 }
                 this._progress_cb_handler()
             })
@@ -65,21 +72,21 @@ class Tmpo {
         $.getJSON(url, data)
         .done((sensors) => {
             this._log("sensor", `sync call for device ${device} successful`)
-            if (--this.progress.device.todo == 0) {
-                this.progress.device.state = "completed"
+            if (--this.progress.sync.device.todo == 0) {
+                this.progress.sync.device.state = "completed"
             }
             this.dbPromise.then(async (db) => {
                 const tx = db.transaction("sensor", "readwrite")
                 tx.objectStore("sensor").put(sensors, device)
                 for (let i in sensors) {
-                    this.progress.sensor.state = "running";
-                    this.progress.sensor.todo++;
+                    this.progress.sync.sensor.state = "running";
+                    this.progress.sync.sensor.todo++;
                     const last = await this._last_block(sensors[i].sensor)
                     this._tmpo_sensor_sync(sensors[i].sensor, last)
                 }
-                if (this.progress.device.state == "completed" &&
-                    this.progress.sensor.state != "running") { // edge case
-                    this.progress.all.state = "completed"
+                if (this.progress.sync.device.state == "completed" &&
+                    this.progress.sync.sensor.state != "running") { // edge case
+                    this.progress.sync.all.state = "completed"
                 }
                 this._progress_cb_handler()
             })
@@ -98,18 +105,19 @@ class Tmpo {
         $.getJSON(url, data)
         .done((blocks) => {
             this._log("tmpo", `sync call for sensor ${sensor} successful`)
-            if (--this.progress.sensor.todo == 0) {
-                this.progress.sensor.state = "completed"
+            if (--this.progress.sync.sensor.todo == 0 &&
+                this.progress.sync.device.state == "completed") {
+                this.progress.sync.sensor.state = "completed"
             }
             for (let i in blocks) {
-                this.progress.block.state = "running";
-                this.progress.block.todo++;
+                this.progress.sync.block.state = "running";
+                this.progress.sync.block.todo++;
                 this._tmpo_block_sync(sensor, blocks[i])
             }
-            if (this.progress.device.state == "completed" &&
-                this.progress.sensor.state == "completed" &&
-                this.progress.block.state != "running") { // edge case
-                this.progress.all.state = "completed"
+            if (this.progress.sync.device.state == "completed" &&
+                this.progress.sync.sensor.state == "completed" &&
+                this.progress.sync.block.state != "running") { // edge case
+                this.progress.sync.all.state = "completed"
             }
             this._progress_cb_handler()
         })
@@ -128,8 +136,12 @@ class Tmpo {
         .done((response) => {
             const key = this._bid2key(sensor, rid, lvl, bid)
             this._log("tmpo", `sync call for block ${key} successful`)
-            if (--this.progress.block.todo == 0) {
-                this.progress.block.state = "completed"
+            if (--this.progress.sync.block.todo == 0 &&
+                this.progress.sync.sensor.state == "completed") {
+                this.progress.sync.block.state = "completed"
+            }
+            if (this.cache) {
+                this.sensor_cache_update[sensor] = true
             }
             this.dbPromise.then((db) => {
                 const tx = db.transaction("tmpo", "readwrite")
@@ -163,15 +175,15 @@ class Tmpo {
             let list2str = keys2delete.toString()
             this._log("clean", `cleaning sensor ${sensor} blocks [${list2str}]`)
             for (let i in keys2delete) {
-                this.progress.clean.state = "running";
-                this.progress.clean.todo++;
+                this.progress.sync.clean.state = "running";
+                this.progress.sync.clean.todo++;
                 this._tmpo_delete_block(keys2delete[i])
             }
-            if (this.progress.device.state == "completed" &&
-                this.progress.sensor.state == "completed" &&
-                this.progress.block.state == "completed" &&
-                this.progress.clean.state != "running") { // edge case
-                this.progress.all.state = "completed"
+            if (this.progress.sync.device.state == "completed" &&
+                this.progress.sync.sensor.state == "completed" &&
+                this.progress.sync.block.state == "completed" &&
+                this.progress.sync.clean.state != "running") { // edge case
+                this.progress.sync.all.state = "completed"
             }
             this._progress_cb_handler()
         })
@@ -186,9 +198,10 @@ class Tmpo {
         })
         .then(() => {
             this._log("clean", `block ${key} deleted`)
-            if (--this.progress.clean.todo == 0) {
-                this.progress.clean.state = "completed"
-                this.progress.all.state = "completed"
+            if (--this.progress.sync.clean.todo == 0 &&
+                this.progress.sync.block.state == "completed") {
+                this.progress.sync.clean.state = "completed"
+                this.progress.sync.all.state = "completed"
             }
             this._progress_cb_handler()
         })
@@ -201,21 +214,18 @@ class Tmpo {
         let head = 0
         const last_cid = await this._cache_last_block(sid)
         if (last_cid) {
-            console.log(last_cid)
             cblock = await this._cache_block_load(sid, last_cid)
             head = (Math.floor(cblock.state.last / 256) + 1) * 256
         }
         const serieslist = await this._serieslist(sid,
                 { head: head, subsample: 8 })
         for (const { t, v } of serieslist) {
-            console.log(t, v)
             for (let [i, _] of t.entries()) {
                 if (!cblock) {
                     cblock = new CachedBlock(t[i], tz_offset)
                 }
                 if (!cblock.push(t[i], v[i])) {
                     this._cache_block_store(sid, cblock)
-                    console.log(cblock)
                     cblock = new CachedBlock(t[i], tz_offset)
                     cblock.push(t[i], v[i])
                 }
@@ -223,7 +233,12 @@ class Tmpo {
         }
         cblock.close()
         this._cache_block_store(sid, cblock)
-        console.log(cblock)
+        if (--this.progress.cache.todo == 0) {
+            this.progress.cache.state = "completed"
+            this.cache_completed = true
+        }
+        this.progress.cache.runtime = Date.now() - this.progress.cache.start
+        this.progress_cb(this.progress)
     }
 
     _cache_block_store(sid, cblock) {
@@ -403,20 +418,40 @@ class Tmpo {
     _progress_state_init(init_state="waiting") {
         return {
             // possible states: waiting/running/completed
-            device: { state: init_state, todo: 0 },
-            sensor: { state: init_state, todo: 0 },
-            block: { state: init_state, todo: 0 },
-            clean: { state: init_state, todo: 0 },
-            all: { state: init_state, start: Date.now(), runtime: 0 }
+            sync: {
+                device: { state: init_state, todo: 0 },
+                sensor: { state: init_state, todo: 0 },
+                block: { state: init_state, todo: 0 },
+                clean: { state: init_state, todo: 0 },
+                all: { state: init_state, start: Date.now(), runtime: 0 }
+            },
+            cache: {
+                state: init_state,
+                todo: 0,
+                start: Date.now(),
+                runtime: 0
+            }
         }
     }
 
     _progress_cb_handler() {
         if (!this.sync_completed) {
-            this.progress.all.runtime = Date.now() - this.progress.all.start
+            this.progress.sync.all.runtime =
+                Date.now() - this.progress.sync.all.start
             this.progress_cb(this.progress)
         }
-        if (this.progress.all.state == "completed") {
+        if (this.progress.sync.all.state == "completed") {
+            this.progress.sync.device.state = "completed"
+            this.progress.sync.sensor.state = "completed"
+            this.progress.sync.block.state = "completed"
+            this.progress.sync.clean.state = "completed"
+            for (const sid in this.sensor_cache_update) {
+                this.progress.cache.state = "running"
+                this.progress.cache.start = Date.now()
+                this.progress.cache.todo++;
+                this._cache_update(sid)
+            }
+            this.sensor_cache_update = { }
             this.sync_completed = true
         }
     }
