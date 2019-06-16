@@ -299,6 +299,25 @@ class Tmpo {
         })
     }
 
+    async _cache_serieslist(sid,
+            { rid=null, head=0, tail=Number.POSITIVE_INFINITY, resample=60,
+              series="avg" } = { }) {
+        if (rid == null) {
+            ({ rid } = await this._cache_last_block(sid))
+        }
+        const cblocklist = await this._cache_blocklist(sid, rid, head, tail)
+        const cblocklist2string = JSON.stringify(cblocklist)
+        this._log("series", `sensor ${sid} using cache blocks: ${cblocklist2string}`)
+        const serieslist = await Promise.all(
+            cblocklist.map(async (cache) => {
+                const cblock = await this._cache_block_load(sid,
+                    cache.rid, cache.cid)
+                return this._cache_block2series(cblock, head, tail, resample, series)
+            })
+        )
+        return serieslist
+    }
+
     async _cache_blocklist(sid, rid, head, tail) {
         const that = this
         // get all cache blocks of a single sensor/rid
@@ -321,6 +340,22 @@ class Tmpo {
         })
     }
 
+    _cache_block2series(cblock, head, tail, resample=60, series="avg") {
+        const start = Math.max(cblock.head,
+                Math.ceil((head / resample) * resample))
+        const stop = Math.min(cblock.head + cblock.day2secs - resample,
+                Math.floor((tail / resample) * resample))
+        const i_start = (start - cblock.head) / resample
+        const i_stop = (stop - cblock.head) / resample
+        const size = i_stop - i_start + 1
+        let t = Array(size)
+        for (let i = 0; i < size; i++) {
+            t[i] = start + i * resample
+        }
+        let v = cblock.series[series][resample].slice(i_start, i_stop + 1)
+        return {t: t, v: v}
+    }
+
     _cache2key(sid, rid, cid) {
         return `${sid}-${rid}-${cid}`
     }
@@ -338,7 +373,12 @@ class Tmpo {
     }
 
     async series(sid, params) {
-        const serieslist = await this._serieslist(sid, params)
+        let serieslist = []
+        if (params.resample) {
+            serieslist = await this._cache_serieslist(sid, params)
+        } else {
+            serieslist = await this._serieslist(sid, params)
+        }
         return this._serieslist_concat(serieslist)
     }
 
