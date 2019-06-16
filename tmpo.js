@@ -455,7 +455,6 @@ class Tmpo {
         if (!this.sync_completed) {
             this.progress.sync.all.runtime =
                 Date.now() - this.progress.sync.all.start
-            this.progress_cb(this.progress)
         }
         if (this.progress.sync.all.state == "completed") {
             this.progress.sync.device.state = "completed"
@@ -468,9 +467,14 @@ class Tmpo {
                 this.progress.cache.todo++;
                 this._cache_update(sid)
             }
+            if (this.progress.cache.state != "running") {
+                this.progress.cache.state = "completed"
+                this.cache_completed = true
+            }
             this.sensor_cache_update = { }
             this.sync_completed = true
         }
+        this.progress_cb(this.progress)
     }
 
     _log(topic, message) {
@@ -536,17 +540,17 @@ class CachedBlock {
     }
 
     close() {
-        const subsampling = [
+        const resampling = [
             { entries: 96, samples: 15, source:   60, sink:   900 },
             { entries: 24, samples:  4, source:  900, sink:  3600 },
             { entries:  1, samples: 24, source: 3600, sink: 86400 }
         ]
-        for (const s of subsampling) {
-            this.subsample(s)
+        for (const r of resampling) {
+            this.resample(r)
         }
     }
 
-    subsample({ entries, samples, source, sink }) {
+    resample({ entries, samples, source, sink }) {
         for (const i of Array(entries).keys()) {
             let slice = {
                 "avg": null,
