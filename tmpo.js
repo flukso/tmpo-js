@@ -219,32 +219,35 @@ class Tmpo {
         })
     }
 
-    async _cache_update(sid) {
+    async _cache_update(sid, rid=null) {
         const day2secs = 86400
         const tz_offset = -7200
+        if (rid == null) {
+            ({ rid } = await this._last_block(sid))
+        }
         let cblock = null
         let head = 0
-        const last_cid = await this._cache_last_block(sid)
-        if (last_cid) {
-            cblock = await this._cache_block_load(sid, last_cid)
+        const last = await this._cache_last_block(sid)
+        if (last.cid > 0 && last.rid == rid) {
+            cblock = await this._cache_block_load(sid, last.rid, last.cid)
             head = (Math.floor(cblock.state.last / 256) + 1) * 256
         }
         const serieslist = await this._serieslist(sid,
-                { head: head, subsample: 8 })
+                { rid: rid, head: head, subsample: 8 })
         for (const { t, v } of serieslist) {
             for (let [i, _] of t.entries()) {
                 if (!cblock) {
                     cblock = new CachedBlock(t[i], tz_offset)
                 }
                 if (!cblock.push(t[i], v[i])) {
-                    this._cache_block_store(sid, cblock)
+                    this._cache_block_store(sid, rid, cblock)
                     cblock = new CachedBlock(t[i], tz_offset)
                     cblock.push(t[i], v[i])
                 }
             }
         }
         cblock.close()
-        this._cache_block_store(sid, cblock)
+        this._cache_block_store(sid, rid, cblock)
         if (--this.progress.cache.todo == 0) {
             this.progress.cache.state = "completed"
             this.cache_completed = true
@@ -253,17 +256,17 @@ class Tmpo {
         this.progress_cb(this.progress)
     }
 
-    _cache_block_store(sid, cblock) {
-        const key = this._cid2key(sid, cblock.head)
+    _cache_block_store(sid, rid, cblock) {
+        const key = this._cache2key(sid, rid, cblock.head)
         this.dbPromise.then((db) => {
             const tx = db.transaction("cache", "readwrite")
             tx.objectStore("cache").put(cblock, key)
         })
     }
 
-    async _cache_block_load(sid, cid) {
+    async _cache_block_load(sid, rid, cid) {
         const db = await this.dbPromise
-        const key = this._cid2key(sid, cid)
+        const key = this._cache2key(sid, rid, cid)
         const tx = db.transaction("cache")
         const store = tx.objectStore("cache")
         let cblock = await store.get(key)
@@ -275,31 +278,63 @@ class Tmpo {
         // get all cache blocks of a single sensor
         const range = IDBKeyRange.bound(sid, `${sid}~`)
         const that = this
-        let last_cid = 0
+        let last = {
+            rid: 0,
+            cid: 0
+        }
         const db = await this.dbPromise
         const tx = db.transaction("cache", "readonly")
         const store = tx.objectStore("cache")
         const cursor = store.openKeyCursor(range)
         return await cursor.then(function process(cursor) {
             if (!cursor) { return }
-            const cid = that._key2cid(cursor.key)
-            if (cid > last_cid) {
-                last_cid = cid
+            const cache = that._key2cache(cursor.key)
+            if (cache.cid > last.cid) {
+                last = cache
             }
             return cursor.continue().then(process)
         })
         .then(() => {
-            return last_cid
+            return last
         })
     }
 
-    _cid2key(sid, cid) {
-        return `${sid}-${cid}`
+    async _cache_blocklist(sid, rid, head, tail) {
+        const that = this
+        // get all cache blocks of a single sensor/rid
+        const range = IDBKeyRange.bound(`${sid}-${rid}`, `${sid}-${rid}~`)
+        const db = await this.dbPromise
+        const tx = db.transaction("cache", "readonly")
+        const store = tx.objectStore("cache")
+        const cursor = store.openKeyCursor(range)
+        let cblocklist = []
+        return await cursor.then(function process(cursor) {
+            if (!cursor) { return }
+            const cache = that._key2cache(cursor.key)
+            if (head < that._cblocktail(cache.cid) && tail > cache.cid) {
+                cblocklist.push(cache)
+            }
+            return cursor.continue().then(process)
+        })
+        .then(() => {
+            return cblocklist.sort((a, b) => a.cid - b.cid)
+        })
     }
 
-    _key2cid(key) {
-        const cblock_id = key.split("-")
-        return Number(cblock_id[1])
+    _cache2key(sid, rid, cid) {
+        return `${sid}-${rid}-${cid}`
+    }
+
+    _key2cache(key) {
+        const cache = key.split("-")
+        return {
+            rid: Number(cache[1]),
+            cid: Number(cache[2])
+        }
+    }
+
+    _cblocktail(cid) {
+        return cid + 86400
     }
 
     async series(sid, params) {
