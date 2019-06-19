@@ -47,9 +47,10 @@ class Tmpo {
         $.getJSON(url, data)
         .done((devices) => {
             this._log("device", `sync call for uid ${this.uid} successful`)
-            this.dbPromise.then((db) => {
+            this.dbPromise.then(async (db) => {
                 const tx = db.transaction("device", "readwrite")
                 tx.objectStore("device").put(devices, this.uid)
+                await tx.done
                 for (let i in devices) {
                     this.progress.sync.device.state = "running"
                     this.progress.sync.device.todo++;
@@ -81,6 +82,7 @@ class Tmpo {
             this.dbPromise.then(async (db) => {
                 const tx = db.transaction("sensor", "readwrite")
                 tx.objectStore("sensor").put(sensors, device)
+                await tx.done
                 for (let i in sensors) {
                     this.progress.sync.sensor.state = "running";
                     this.progress.sync.sensor.todo++;
@@ -152,9 +154,10 @@ class Tmpo {
                 this.progress.sync.sensor.state == "completed") {
                 this.progress.sync.block.state = "completed"
             }
-            this.dbPromise.then((db) => {
+            this.dbPromise.then(async (db) => {
                 const tx = db.transaction("tmpo", "readwrite")
                 tx.objectStore("tmpo").put(response, key)
+                await tx.done
                 this._tmpo_clean(sensor, block)
             })
         })
@@ -260,9 +263,10 @@ class Tmpo {
 
     _cache_block_store(sid, rid, cblock) {
         const key = this._cache2key(sid, rid, cblock.head)
-        this.dbPromise.then((db) => {
+        this.dbPromise.then(async (db) => {
             const tx = db.transaction("cache", "readwrite")
             tx.objectStore("cache").put(cblock, key)
+            await tx.done
         })
     }
 
