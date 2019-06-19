@@ -246,8 +246,10 @@ class Tmpo {
                 }
             }
         }
-        cblock.close()
-        this._cache_block_store(sid, rid, cblock)
+        if (cblock) {
+            cblock.close()
+            this._cache_block_store(sid, rid, cblock)
+        }
         if (--this.progress.cache.todo == 0) {
             this.progress.cache.state = "completed"
             this.cache_completed = true
