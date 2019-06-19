@@ -111,6 +111,9 @@ class Tmpo {
         $.getJSON(url, data)
         .done((blocks) => {
             this._log("tmpo", `sync call for sensor ${sensor} successful`)
+            if (this.cache) {
+                this.sensor_cache_update[sensor] = true
+            }
             if (--this.progress.sync.sensor.todo == 0 &&
                 this.progress.sync.device.state == "completed") {
                 this.progress.sync.sensor.state = "completed"
@@ -148,9 +151,6 @@ class Tmpo {
             if (--this.progress.sync.block.todo == 0 &&
                 this.progress.sync.sensor.state == "completed") {
                 this.progress.sync.block.state = "completed"
-            }
-            if (this.cache) {
-                this.sensor_cache_update[sensor] = true
             }
             this.dbPromise.then((db) => {
                 const tx = db.transaction("tmpo", "readwrite")
