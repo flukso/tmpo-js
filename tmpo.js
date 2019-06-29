@@ -141,6 +141,7 @@ class Tmpo {
         const rid = block.rid
         const lvl = block.lvl
         const bid = block.bid
+        const key = this._bid2key(sensor, rid, lvl, bid)
         const url = `https://www.flukso.net/api/sensor/${sensor}/tmpo/${rid}/${lvl}/${bid}`
         const data = {
             version: "1.0",
@@ -148,7 +149,6 @@ class Tmpo {
         }
         $.getJSON(url, data)
         .done((response) => {
-            const key = this._bid2key(sensor, rid, lvl, bid)
             this._log("tmpo", `sync call for block ${key} successful`)
             if (--this.progress.sync.block.todo == 0 &&
                 this.progress.sync.sensor.state == "completed") {
@@ -162,6 +162,7 @@ class Tmpo {
             })
         })
         .fail(() => {
+            this._log("tmpo", `sync call for block ${key} failed`)
             this.progress.sync.all.http_error++
         })
     }
@@ -403,7 +404,8 @@ class Tmpo {
             blocklist.map(async (block) => {
                 const content = await this._block_content(sid,
                     block.rid, block.lvl, block.bid)
-                return this._block2series(content, head, tail, subsample)
+                const key = this._bid2key(sid, block.rid, block.lvl, block.bid)
+                return this._block2series(key, content, head, tail, subsample)
             })
         )
         return serieslist
@@ -459,7 +461,11 @@ class Tmpo {
         })
     }
 
-    _block2series(content, head, tail, subsample=0) {
+    _block2series(key, content, head, tail, subsample=0) {
+        if (content == null) {
+            this._log("tmpo", `block2series for block ${key} failed: empty block`)
+            return {t: [], v: []}
+        }
         let [t_accu, v_accu] = content.h.head
         let t_accu_last = 0
         let t = []
