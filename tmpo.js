@@ -5,12 +5,13 @@ $.ajaxSetup({
 
 
 class Tmpo {
-    constructor(uid, token, cache=true, debug=false) {
-        this.uid = uid
+    constructor(sid, token, progress_cb = (() => { return }),
+            resample=true, debug=false) {
+        this.sid = sid
         this.token = token
-        this.cache = cache
+        this.resample = resample
         this.debug = debug
-        this.dbPromise = idb.open("flukso", 2, (upgradeDB) => {
+        this.dbPromise = idb.open("flukso", 3, (upgradeDB) => {
             switch (upgradeDB.oldVersion) {
             case 0: // called at DB creation time
                 upgradeDB.createObjectStore("device")
@@ -18,91 +19,40 @@ class Tmpo {
                 upgradeDB.createObjectStore("tmpo")
             case 1:
                 upgradeDB.createObjectStore("cache")
+            case 2:
+                upgradeDB.deleteObjectStore("device")
+                upgradeDB.deleteObjectStore("sensor")
             }
         })
-        this.sync_completed = true
-        this.cache_completed = true
-        this.sensor_cache_update = { }
-        this.progress = this._progress_state_init("completed")
-        this.progress_cb = (() => { return })
-    }
-
-    sync(progress_cb = (() => { return })) {
-        this.sync_completed = false
-        if (this.cache) {
-            this.cache_completed = false
-        }
-        this.progress = this._progress_state_init("waiting")
-        this.progress.sync.all.state = "running"
+        this.progress = this._progress_state_init()
         this.progress_cb = progress_cb
-        this._device_sync()
     }
 
-    _device_sync() {
-        const url = `https://www.flukso.net/api/user/${this.uid}/device`
-        const data = {
-            version: "1.0",
-            token: this.token
-        }
-        $.getJSON(url, data)
-        .done((devices) => {
-            this._log("device", `sync call for uid ${this.uid} successful`)
-            this.dbPromise.then(async (db) => {
-                const tx = db.transaction("device", "readwrite")
-                tx.objectStore("device").put(devices, this.uid)
-                await tx.complete
-                for (let i in devices) {
-                    this.progress.sync.device.state = "running"
-                    this.progress.sync.device.todo++;
-                    this._sensor_sync(devices[i].device)
-                }
-                if (this.progress.sync.device.state == "waiting") {
-                    this.progress.sync.all.state = "completed"
-                }
+    async sync() {
+        this.progress = this._progress_state_init("waiting")
+        const last = await this._last_block()
+        try {
+            await this._tmpo_sensor_sync(last)
+            this.progress.sync.state == "completed"
+            this.progress.clean.state == "completed"
+            this._progress_cb_handler()
+            if (this.resample) {
+                await this._cache_update()
+                this.progress.resample.state == "completed"
                 this._progress_cb_handler()
-            })
-        })
-        .fail(() => {
-            this.progress.sync.all.http_error++
-        })
-    }
-
-    _sensor_sync(device) {
-        const url = `https://www.flukso.net/api/device/${device}/sensor`
-        const data = {
-            version: "1.0",
-            token: this.token
-        }
-        $.getJSON(url, data)
-        .done((sensors) => {
-            this._log("sensor", `sync call for device ${device} successful`)
-            if (--this.progress.sync.device.todo == 0) {
-                this.progress.sync.device.state = "completed"
             }
-            this.dbPromise.then(async (db) => {
-                const tx = db.transaction("sensor", "readwrite")
-                tx.objectStore("sensor").put(sensors, device)
-                await tx.complete
-                for (let i in sensors) {
-                    this.progress.sync.sensor.state = "running";
-                    this.progress.sync.sensor.todo++;
-                    const last = await this._last_block(sensors[i].sensor)
-                    this._tmpo_sensor_sync(sensors[i].sensor, last)
-                }
-                if (this.progress.sync.device.state == "completed" &&
-                    this.progress.sync.sensor.state != "running") { // edge case
-                    this.progress.sync.all.state = "completed"
-                }
-                this._progress_cb_handler()
-            })
-        })
-        .fail(() => {
-            this.progress.sync.all.http_error++
-        })
+            return true
+        } catch(err) {
+            this.progress.sync.state == "error"
+            this.progress.error = err
+            this._progress_cb_handler()
+            return false
+        }
     }
 
-    _tmpo_sensor_sync(sensor, last = { rid: 0, lvl: 0, bid: 0 }) {
-        const url = `https://www.flukso.net/api/sensor/${sensor}/tmpo/sync`
+    async _tmpo_sensor_sync(last = { rid: 0, lvl: 0, bid: 0 }) {
+        let prom = Array()
+        const url = `https://www.flukso.net/api/sensor/${this.sid}/tmpo/sync`
         const data = {
             version: "1.0",
             token: this.token,
@@ -110,73 +60,55 @@ class Tmpo {
             lvl: last.lvl,
             bid: last.bid
         }
-        $.getJSON(url, data)
-        .done((blocks) => {
-            this._log("tmpo", `sync call for sensor ${sensor} successful`)
-            if (this.cache) {
-                this.sensor_cache_update[sensor] = true
-            }
-            if (--this.progress.sync.sensor.todo == 0 &&
-                this.progress.sync.device.state == "completed") {
-                this.progress.sync.sensor.state = "completed"
-            }
-            for (let i in blocks) {
-                this.progress.sync.block.state = "running";
-                this.progress.sync.block.todo++;
-                this._tmpo_block_sync(sensor, blocks[i])
-            }
-            if (this.progress.sync.device.state == "completed" &&
-                this.progress.sync.sensor.state == "completed" &&
-                this.progress.sync.block.state != "running") { // edge case
-                this.progress.sync.all.state = "completed"
-            }
-            this._progress_cb_handler()
+        const blocks = await $.ajax({
+            dataType: "json",
+            url: url,
+            data: data
         })
-        .fail(() => {
-            this.progress.sync.all.http_error++
-        })
+        this._log("tmpo", `sync call for sensor ${this.sid} successful`)
+        for (const block of blocks) {
+            this.progress.sync.state = "running";
+            this.progress.sync.todo++;
+            prom.push(this._tmpo_block_sync(block))
+        }
+        return Promise.all(prom)
     }
 
-    _tmpo_block_sync(sensor, block) {
+    async _tmpo_block_sync(block) {
         const rid = block.rid
         const lvl = block.lvl
         const bid = block.bid
-        const key = this._bid2key(sensor, rid, lvl, bid)
-        const url = `https://www.flukso.net/api/sensor/${sensor}/tmpo/${rid}/${lvl}/${bid}`
+        const key = this._bid2key(this.sid, rid, lvl, bid)
+        const url = `https://www.flukso.net/api/sensor/${this.sid}/tmpo/${rid}/${lvl}/${bid}`
         const data = {
             version: "1.0",
             token: this.token
         }
-        $.getJSON(url, data)
-        .done((response) => {
-            this._log("tmpo", `sync call for block ${key} successful`)
-            if (--this.progress.sync.block.todo == 0 &&
-                this.progress.sync.sensor.state == "completed") {
-                this.progress.sync.block.state = "completed"
-            }
-            this.dbPromise.then(async (db) => {
-                const tx = db.transaction("tmpo", "readwrite")
-                tx.objectStore("tmpo").put(response, key)
-                await tx.complete
-                this._tmpo_clean(sensor, block)
-            })
+        const response = await $.ajax({
+            dataType: "json",
+            url: url,
+            data: data
         })
-        .fail(() => {
-            this._log("tmpo", `sync call for block ${key} failed`)
-            this.progress.sync.all.http_error++
-        })
+        this._log("tmpo", `sync call for block ${key} successful`)
+        const db = await this.dbPromise
+        const tx = db.transaction("tmpo", "readwrite")
+        tx.objectStore("tmpo").put(response, key)
+        await tx.complete
+        this._log("tmpo", `block ${key} stored locally`)
+        await this._tmpo_clean(block)
+        this.progress.sync.todo--;
+        this._progress_cb_handler()
     }
 
-    _tmpo_clean(sensor, last) {
-        const range = IDBKeyRange.bound(sensor, `${sensor}~`)
+    async _tmpo_clean(last) {
+        const range = IDBKeyRange.bound(this.sid, `${this.sid}~`)
         const that = this // for 'process' function scoping
-        let keys2delete = []
-        this.dbPromise.then((db) => {
-            const tx = db.transaction("tmpo", "readonly")
-            const store = tx.objectStore("tmpo")
-            return store.openKeyCursor(range)
-        })
-        .then(function process(cursor) {
+        const db = await this.dbPromise
+        const tx = db.transaction("tmpo", "readonly")
+        const store = tx.objectStore("tmpo")
+        const cursor = store.openKeyCursor(range)
+        let keys2delete = Array()
+        return await cursor.then(function process(cursor) {
             if (last.lvl == 8) { return }
             if (!cursor) { return }
             const block = that._key2bid(cursor.key)
@@ -187,56 +119,43 @@ class Tmpo {
             }
             return cursor.continue().then(process)
         })
-        .then(() => {
+        .then(async () => {
             let list2str = keys2delete.toString()
-            this._log("clean", `cleaning sensor ${sensor} blocks [${list2str}]`)
-            for (let i in keys2delete) {
-                this.progress.sync.clean.state = "running";
-                this.progress.sync.clean.todo++;
-                this._tmpo_delete_block(keys2delete[i])
+            this._log("clean", `cleaning sensor ${this.sid} blocks [${list2str}]`)
+            for (const key of keys2delete) {
+                this.progress.clean.state = "running";
+                this.progress.clean.todo++;
+                await this._tmpo_delete_block(key)
             }
-            if (this.progress.sync.device.state == "completed" &&
-                this.progress.sync.sensor.state == "completed" &&
-                this.progress.sync.block.state == "completed" &&
-                this.progress.sync.clean.state != "running") { // edge case
-                this.progress.sync.all.state = "completed"
-            }
-            this._progress_cb_handler()
         })
     }
 
     async _tmpo_delete_block(key) {
-        this.dbPromise.then((db) => {
-            const tx = db.transaction("tmpo", "readwrite")
-            const store = tx.objectStore("tmpo")
-            store.delete(key)
-            return tx.complete
-        })
-        .then(() => {
-            this._log("clean", `block ${key} deleted`)
-            if (--this.progress.sync.clean.todo == 0 &&
-                this.progress.sync.block.state == "completed") {
-                this.progress.sync.clean.state = "completed"
-                this.progress.sync.all.state = "completed"
-            }
-            this._progress_cb_handler()
-        })
+        const db = await this.dbPromise
+        const tx = db.transaction("tmpo", "readwrite")
+        tx.objectStore("tmpo").delete(key)
+        await tx.complete
+        this._log("clean", `block ${key} deleted`)
+        this.progress.clean.todo--;
+        this._progress_cb_handler()
     }
 
-    async _cache_update(sid, rid=null) {
+    async _cache_update(rid=null) {
+        this.progress.resample.state == "running"
+        this._progress_cb_handler()
         const day2secs = 86400
         const tz_offset = -7200
         if (rid == null) {
-            ({ rid } = await this._last_block(sid))
+            ({ rid } = await this._last_block())
         }
         let cblock = null
         let head = 0
-        const last = await this._cache_last_block(sid)
+        const last = await this._cache_last_block()
         if (last.cid > 0 && last.rid == rid) {
-            cblock = await this._cache_block_load(sid, last.rid, last.cid)
+            cblock = await this._cache_block_load(last.rid, last.cid)
             head = (Math.floor(cblock.state.last / 256) + 1) * 256
         }
-        const serieslist = await this._serieslist(sid,
+        const serieslist = await this._serieslist(
                 { rid: rid, head: head, subsample: 8 })
         for (const { t, v } of serieslist) {
             for (let [i, _] of t.entries()) {
@@ -244,7 +163,7 @@ class Tmpo {
                     cblock = new CachedBlock(t[i], tz_offset)
                 }
                 if (!cblock.push(t[i], v[i])) {
-                    this._cache_block_store(sid, rid, cblock)
+                    this._cache_block_store(rid, cblock)
                     cblock = new CachedBlock(t[i], tz_offset)
                     cblock.push(t[i], v[i])
                 }
@@ -252,18 +171,12 @@ class Tmpo {
         }
         if (cblock) {
             cblock.close()
-            this._cache_block_store(sid, rid, cblock)
+            this._cache_block_store(rid, cblock)
         }
-        if (--this.progress.cache.todo == 0) {
-            this.progress.cache.state = "completed"
-            this.cache_completed = true
-        }
-        this.progress.cache.runtime = Date.now() - this.progress.cache.start
-        this.progress_cb(this.progress)
     }
 
-    _cache_block_store(sid, rid, cblock) {
-        const key = this._cache2key(sid, rid, cblock.head)
+    _cache_block_store(rid, cblock) {
+        const key = this._cache2key(this.sid, rid, cblock.head)
         this.dbPromise.then((db) => {
             const tx = db.transaction("cache", "readwrite")
             tx.objectStore("cache").put(cblock, key)
@@ -274,9 +187,9 @@ class Tmpo {
         })
     }
 
-    async _cache_block_load(sid, rid, cid) {
+    async _cache_block_load(rid, cid) {
         const db = await this.dbPromise
-        const key = this._cache2key(sid, rid, cid)
+        const key = this._cache2key(this.sid, rid, cid)
         const tx = db.transaction("cache")
         const store = tx.objectStore("cache")
         let cblock = await store.get(key)
@@ -284,9 +197,9 @@ class Tmpo {
         return cblock
     }
 
-    async _cache_last_block(sid) {
+    async _cache_last_block() {
         // get all cache blocks of a single sensor
-        const range = IDBKeyRange.bound(sid, `${sid}~`)
+        const range = IDBKeyRange.bound(this.sid, `${this.sid}~`)
         const that = this
         let last = {
             rid: 0,
@@ -309,29 +222,28 @@ class Tmpo {
         })
     }
 
-    async _cache_serieslist(sid,
+    async _cache_serieslist(
             { rid=null, head=0, tail=Number.POSITIVE_INFINITY, resample=60,
               series="avg" } = { }) {
         if (rid == null) {
-            ({ rid } = await this._cache_last_block(sid))
+            ({ rid } = await this._cache_last_block())
         }
-        const cblocklist = await this._cache_blocklist(sid, rid, head, tail)
+        const cblocklist = await this._cache_blocklist(rid, head, tail)
         const cblocklist2string = JSON.stringify(cblocklist)
-        this._log("series", `sensor ${sid} using cache blocks: ${cblocklist2string}`)
+        this._log("series", `sensor ${this.sid} using cache blocks: ${cblocklist2string}`)
         const serieslist = await Promise.all(
             cblocklist.map(async (cache) => {
-                const cblock = await this._cache_block_load(sid,
-                    cache.rid, cache.cid)
+                const cblock = await this._cache_block_load(cache.rid, cache.cid)
                 return this._cache_block2series(cblock, head, tail, resample, series)
             })
         )
         return serieslist
     }
 
-    async _cache_blocklist(sid, rid, head, tail) {
+    async _cache_blocklist(rid, head, tail) {
         const that = this
         // get all cache blocks of a single sensor/rid
-        const range = IDBKeyRange.bound(`${sid}-${rid}`, `${sid}-${rid}~`)
+        const range = IDBKeyRange.bound(`${this.sid}-${rid}`, `${this.sid}-${rid}~`)
         const db = await this.dbPromise
         const tx = db.transaction("cache", "readonly")
         const store = tx.objectStore("cache")
@@ -382,38 +294,40 @@ class Tmpo {
         return cid + 86400
     }
 
-    async series(sid, params) {
+    async series(params, sync=false) {
+        if (sync) {
+            await this.sync()
+        }
         let serieslist = []
         if (params.resample) {
-            serieslist = await this._cache_serieslist(sid, params)
+            serieslist = await this._cache_serieslist(params)
         } else {
-            serieslist = await this._serieslist(sid, params)
+            serieslist = await this._serieslist(params)
         }
         return this._serieslist_concat(serieslist)
     }
 
-    async _serieslist(sid,
+    async _serieslist(
             { rid=null, head=0, tail=Number.POSITIVE_INFINITY, subsample=0 } = { }) {
         if (rid == null) {
-            ({ rid } = await this._last_block(sid))
+            ({ rid } = await this._last_block())
         }
-        const blocklist = await this._blocklist(sid, rid, head, tail)
+        const blocklist = await this._blocklist(rid, head, tail)
         const blocklist2string = JSON.stringify(blocklist)
-        this._log("series", `sensor ${sid} using blocks: ${blocklist2string}`)
+        this._log("series", `sensor ${this.sid} using blocks: ${blocklist2string}`)
         const serieslist = await Promise.all(
             blocklist.map(async (block) => {
-                const content = await this._block_content(sid,
-                    block.rid, block.lvl, block.bid)
-                const key = this._bid2key(sid, block.rid, block.lvl, block.bid)
+                const content = await this._block_content(block.rid, block.lvl, block.bid)
+                const key = this._bid2key(this.sid, block.rid, block.lvl, block.bid)
                 return this._block2series(key, content, head, tail, subsample)
             })
         )
         return serieslist
     }
 
-    async _last_block(sid) {
+    async _last_block() {
         // get all tmpo blocks of a single sensor
-        const range = IDBKeyRange.bound(sid, `${sid}~`)
+        const range = IDBKeyRange.bound(this.sid, `${this.sid}~`)
         const that = this
         let last = {
             rid: 0,
@@ -433,16 +347,16 @@ class Tmpo {
             return cursor.continue().then(process)
         })
         .then(() => {
-            const last_key = that._bid2key(sid, last.rid, last.lvl, last.bid)
+            const last_key = that._bid2key(that.sid, last.rid, last.lvl, last.bid)
             that._log("last", `last block: ${last_key}`)
             return last
         })
     }
 
-    async _blocklist(sid, rid, head, tail) {
+    async _blocklist(rid, head, tail) {
         const that = this
         // get all tmpo blocks of a single sensor/rid
-        const range = IDBKeyRange.bound(`${sid}-${rid}`, `${sid}-${rid}~`)
+        const range = IDBKeyRange.bound(`${this.sid}-${rid}`, `${this.sid}-${rid}~`)
         const db = await this.dbPromise
         const tx = db.transaction("tmpo", "readonly")
         const store = tx.objectStore("tmpo")
@@ -492,9 +406,9 @@ class Tmpo {
         return accu
     }
 
-    async _block_content(sid, rid, lvl, bid) {
+    async _block_content(rid, lvl, bid) {
         const db = await this.dbPromise
-        const key = this._bid2key(sid, rid, lvl, bid)
+        const key = this._bid2key(this.sid, rid, lvl, bid)
         const tx = db.transaction("tmpo")
         const store = tx.objectStore("tmpo")
         return store.get(key)
@@ -519,57 +433,24 @@ class Tmpo {
 
     _progress_state_init(init_state="waiting") {
         return {
-            // possible states: waiting/running/completed
-            sync: {
-                device: { state: init_state, todo: 0 },
-                sensor: { state: init_state, todo: 0 },
-                block: { state: init_state, todo: 0 },
-                clean: { state: init_state, todo: 0 },
-                all: {
-                    state: init_state,
-                    http_error: 0,
-                    start: Date.now(),
-                    runtime: 0
-                }
-            },
-            cache: {
-                state: init_state,
-                todo: 0,
-                start: Date.now(),
-                runtime: 0
-            }
+            // possible states: waiting/running/completed/error
+            sync: { state: init_state, todo: 0 },
+            clean: { state: init_state, todo: 0 },
+            resample: { state: init_state, todo: 0 },
+            time: { start: Date.now(), runtime: 0 },
+            error: null
         }
     }
 
     _progress_cb_handler() {
-        if (!this.sync_completed) {
-            this.progress.sync.all.runtime =
-                Date.now() - this.progress.sync.all.start
-        }
-        if (this.progress.sync.all.state == "completed") {
-            this.progress.sync.device.state = "completed"
-            this.progress.sync.sensor.state = "completed"
-            this.progress.sync.block.state = "completed"
-            this.progress.sync.clean.state = "completed"
-            for (const sid in this.sensor_cache_update) {
-                this.progress.cache.state = "running"
-                this.progress.cache.start = Date.now()
-                this.progress.cache.todo++;
-                this._cache_update(sid)
-            }
-            if (this.progress.cache.state != "running") {
-                this.progress.cache.state = "completed"
-                this.cache_completed = true
-            }
-            this.sensor_cache_update = { }
-            this.sync_completed = true
-        }
+        this.progress.time.runtime =
+                Date.now() - this.progress.time.start
         this.progress_cb(this.progress)
     }
 
     _log(topic, message) {
         if (this.debug) {
-            let time = Date.now()
+            const time = Date.now()
             console.log(`${time} [${topic}] ${message}`)
         }
     }
