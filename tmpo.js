@@ -6,7 +6,7 @@ $.ajaxSetup({
 
 class Tmpo {
     constructor(sid, token, progress_cb = (() => { return }),
-            resample=true, debug=false) {
+            resample=true, purge=true, debug=false) {
         this.sid = sid
         this.token = token
         this.resample = resample
@@ -33,17 +33,20 @@ class Tmpo {
         const last = await this._last_block()
         try {
             await this._tmpo_sensor_sync(last)
-            this.progress.sync.state == "completed"
-            this.progress.clean.state == "completed"
+            this.progress.sync.state = "completed"
+            this.progress.clean.state = "completed"
             this._progress_cb_handler()
             if (this.resample) {
                 await this._cache_update()
-                this.progress.resample.state == "completed"
+                this.progress.resample.state = "completed"
                 this._progress_cb_handler()
+            }
+            if (this.purge) {
+                this._tmpo_purge()
             }
             return true
         } catch(err) {
-            this.progress.sync.state == "error"
+            this.progress.sync.state = "error"
             this.progress.error = err
             this._progress_cb_handler()
             return false
@@ -126,8 +129,38 @@ class Tmpo {
                 this.progress.clean.state = "running";
                 this.progress.clean.todo++;
                 await this._tmpo_delete_block(key)
+                this.progress.clean.todo--;
+                this._progress_cb_handler()
             }
         })
+    }
+
+    async _tmpo_purge() {
+        // purge all block20's except for the last one
+        let rid
+        ({ rid } = await this._last_block())
+        const range = IDBKeyRange.bound(`${this.sid}-${rid}-20`, `${this.sid}-${rid}-20~`)
+        const that = this // for 'process' function scoping
+        const db = await this.dbPromise
+        const tx = db.transaction("tmpo", "readonly")
+        const store = tx.objectStore("tmpo")
+        const cursor = store.openKeyCursor(range)
+        let keys2delete = Array()
+        cursor.then(function process(cursor) {
+            if (!cursor) { return }
+            keys2delete.push(cursor.key)
+            return cursor.continue().then(process)
+        })
+        .then(async () => {
+            keys2delete.sort()
+            keys2delete.pop()
+            let list2str = keys2delete.toString()
+            this._log("purge", `purging sensor ${this.sid} blocks [${list2str}]`)
+            for (const key of keys2delete) {
+                this._tmpo_delete_block(key)
+            }
+        })
+
     }
 
     async _tmpo_delete_block(key) {
@@ -135,13 +168,11 @@ class Tmpo {
         const tx = db.transaction("tmpo", "readwrite")
         tx.objectStore("tmpo").delete(key)
         await tx.complete
-        this._log("clean", `block ${key} deleted`)
-        this.progress.clean.todo--;
-        this._progress_cb_handler()
+        this._log("del", `block ${key} deleted`)
     }
 
     async _cache_update(rid=null) {
-        this.progress.resample.state == "running"
+        this.progress.resample.state = "running"
         this._progress_cb_handler()
         const day2secs = 86400
         const tz_offset = -7200
